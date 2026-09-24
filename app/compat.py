@@ -23,6 +23,13 @@ error，否则降级为 warning —— 未激活的分支不会单独被判为�
 反例会用 ``jsonschema`` 做一次最终校验（source 合法且 target 拒绝），
 保证返回的 counterexample 真实有效；启发式检查（pattern、multipleOf、
 anyOf 覆盖等）若无法构造出经过验证的反例，则降级为 warning。
+
+``$ref`` 预展开按 schema 方言区分语义（见 resolve_refs）：Draft
+2019-09/2020-12 中 ``$ref`` 与同级的 minimum、required 等约束同时生效，
+展开为合取结构；Draft-07 及更早规范中同级约束被忽略，直接以内联目标
+替换。嵌套引用递归展开，引用链成环时终止内联。最终反例统一在**原始
+两版 schema**上验证（analyze 构造校验器并传入 find_violations），
+保证旧方言与循环引用等场景下的反例都真实有效。
 """
 from __future__ import annotations
 
@@ -90,38 +97,135 @@ def member_of_enum(value: Any, enum: list) -> bool:
 # ---------------------------------------------------------------------------
 # $ref 预解析（支持文档内 #/... 引用，带环保护）
 # ---------------------------------------------------------------------------
+#
+# 不同规范下 ``$ref`` 的同级约束语义不同，展开时必须分别处理：
+#
+# * Draft 2019-09 / 2020-12：``$ref`` 与同级的 ``minimum``、``required``、
+#   ``type`` 等关键字**同时生效**。展开时把引用目标与同级约束合并
+#   （以 allOf 叠加，保证 type 交集、required 并集等语义正确）；
+# * Draft-04 / 06 / 07 等旧规范：``$ref`` 是引用跳转，**同级关键字被忽略**。
+#   展开时直接以内联目标替换，同级约束不参与（与 jsonschema 旧版校验器的
+#   实际行为一致）。
+#
+# 嵌套引用（目标内再引用）逐层递归展开；引用链成环时终止——旧规范在环上
+# 退化为裸 ``$ref`` 节点，新规范保留同级约束但不再重复内联目标，由
+# ``effective`` / 各遍历器的幂等处理保证结构比较可终止。反例的最终
+# 可信度始终由**原始 schema**上的 jsonschema 校验把关（见 analyze）。
 
-def resolve_refs(schema: Any, root: Any = None, seen: frozenset[str] = frozenset()) -> Any:
+_LEGACY_REF_DIALECTS = ("draft-04", "draft/04", "draft-06", "draft/06",
+                        "draft-07", "draft/07")
+
+
+def _is_modern_ref_dialect(schema: Any) -> bool:
+    """判断 schema 是否采用 2019-09+ 语义（$ref 与同级约束同时生效）。
+
+    显式声明 ``$schema`` 时按声明选择；未声明时 jsonschema 默认使用最新
+    draft（2020-12），故默认按新语义处理——只有出现旧版形态（draft-07 及
+    更早的元 schema 声明、draft-04 布尔型 exclusiveMinimum/Maximum、
+    数组形式 items 元组写法）才按旧语义处理。
+    """
+    declared = schema.get("$schema") if isinstance(schema, dict) else None
+    if isinstance(declared, str):
+        lowered = declared.lower()
+        if "2019-09" in lowered or "2020-12" in lowered:
+            return True
+        if any(token in lowered for token in _LEGACY_REF_DIALECTS):
+            return False
+    return not _uses_legacy_dialect(schema, frozenset())
+
+
+def _resolve_pointer(root: Any, pointer: str) -> tuple[Any, bool]:
+    """按 JSON Pointer 在文档内解析 ``#`` / ``#/...`` 目标。"""
+    if pointer == "#":
+        return root, True
+    if not pointer.startswith("#/"):
+        return None, False
+    node: Any = root
+    for part in pointer[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None, False
+    return node, True
+
+
+def _combine_ref_siblings(siblings: dict, target: Any) -> Any:
+    """新规范语义：合并引用目标与同级约束（两者同时生效）。
+
+    表示为“同级约束在外、引用目标作为 ``allOf`` 分支”的叠加结构：
+
+    * ``jsonschema`` 校验结果与 ``$ref`` 并列关键字完全等价；
+    * ``effective`` 浅合并时以目标分支覆盖冲突的数值/长度边界
+      （取更严者），``required`` 取并集、``type`` 取交集、
+      ``enum`` 取交集、``properties`` 递归合并，均符合合取语义。
+    """
+    if target is True:
+        return {k: copy.deepcopy(v) for k, v in siblings.items() if k != "$ref"}
+    if target is False:
+        # 目标拒绝一切：整体即为 false（同级约束不可能放松它）
+        return False
+    own = {k: copy.deepcopy(v) for k, v in siblings.items() if k != "$ref"}
+    if not own:
+        return copy.deepcopy(target)
+    branches = list(own.pop("allOf", [])) + [copy.deepcopy(target)]
+    own["allOf"] = branches
+    return own
+
+
+def resolve_refs(schema: Any, root: Any = None, seen: frozenset[str] = frozenset(),
+                 modern: bool | None = None) -> Any:
+    """递归展开文档内本地 ``$ref``（``#`` / ``#/...``）。
+
+    modern=True 按 2019-09+ 语义保留同级约束；modern=False 按 Draft-07 等
+    旧规范语义忽略同级；modern=None 时按根 schema 的 ``$schema`` 声明与
+    形态推断，整个文档沿用同一方言。
+    """
     if root is None:
         root = schema
+    if modern is None:
+        modern = _is_modern_ref_dialect(root)
     if schema is True or schema is False:
         return schema
     if not isinstance(schema, dict):
         return schema
 
     ref = schema.get("$ref")
-    if isinstance(ref, str) and ref.startswith("#/") and ref not in seen:
-        node: Any = root
-        ok = True
-        for part in ref[2:].split("/"):
-            part = part.replace("~1", "/").replace("~0", "~")
-            if isinstance(node, dict) and part in node:
-                node = node[part]
+    if isinstance(ref, str):
+        node, ok = _resolve_pointer(root, ref)
+        if ok and ref not in seen:
+            target_resolved = resolve_refs(copy.deepcopy(node), root,
+                                           seen | {ref}, modern)
+            if modern:
+                return _combine_ref_siblings(schema, target_resolved)
+            return target_resolved
+        if ok and ref in seen:
+            # 引用链成环：终止内联。旧规范退化为裸 $ref（同级本就被忽略）；
+            # 新规范保留并继续展开同级约束，$ref 键留给原始校验器解析。
+            if modern:
+                siblings = {k: v for k, v in schema.items() if k != "$ref"}
+                if not siblings:
+                    return {"$ref": ref}
+                schema = siblings  # 落入下方通用递归
             else:
-                ok = False
-                break
-        if ok:
-            return resolve_refs(copy.deepcopy(node), root, seen | {ref})
-        # 无法解析的引用按"无约束"处理，避免误报
-        return True
+                return {"$ref": ref}
+        elif not ref.startswith("#"):
+            # 外部引用（http(s)://、文件路径、裸名称锚点等）保持原样：
+            # 结构比较把它当无约束节点，最终由原始 schema 校验把关
+            pass
+        elif not ok:
+            # 无法解析的本地引用按"无约束"处理，避免误报
+            return True
 
     out: dict[str, Any] = {}
     for key, value in schema.items():
         if isinstance(value, dict):
-            out[key] = resolve_refs(value, root, seen)
+            out[key] = resolve_refs(value, root, seen, modern)
         elif isinstance(value, list):
             out[key] = [
-                resolve_refs(item, root, seen) if isinstance(item, dict) else item
+                resolve_refs(item, root, seen, modern) if isinstance(item, (dict, list)) else item
                 for item in value
             ]
         else:
@@ -708,10 +812,20 @@ class IssueBuilder:
         })
 
 
-def find_violations(source_root: Any, target_root: Any) -> list[dict]:
-    """返回 source 合法但 target 拒绝的所有结构性问题。"""
-    source_validator = make_validator(source_root)
-    target_validator = make_validator(target_root)
+def find_violations(source_root: Any, target_root: Any,
+                    source_validator=None, target_validator=None) -> list[dict]:
+    """返回 source 合法但 target 拒绝的所有结构性问题。
+
+    结构比较在 ``$ref`` 预展开后的 schema 上进行；反例校验器默认也由
+    展开结果构造，但调用方可以传入**原始 schema**的校验器
+    （analyze 即如此），确保每个 counterexample 都经原始两版 schema
+    验证——尤其是 Draft-07 等旧规范里 ``$ref`` 同级约束被忽略、循环
+    引用未被内联等展开结构无法完整表达的语义。
+    """
+    if source_validator is None:
+        source_validator = make_validator(source_root)
+    if target_validator is None:
+        target_validator = make_validator(target_root)
     builder = IssueBuilder(source_root, target_root, source_validator, target_validator)
     _check(effective(source_root), effective(target_root), (), builder,
            source_root, target_root, source_validator, target_validator)
@@ -1187,6 +1301,36 @@ def _check_array(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> No
 
 
 
+def _number_candidates(schema: dict, bound: float, exclusive: bool,
+                       direction: str) -> list:
+    """枚举边界收紧后“source 仍允许、target 拒绝”的候选值。
+
+    优先给出 int（两侧都允许 integer 时反例为整数，如 4 而非 4.0），
+    其次才退回 float；每个候选最终仍需通过 source/target 双向验证。
+    """
+    integer_allowed = bool(type_set(schema) and "integer" in (type_set(schema) or set()))
+    if direction == "min":
+        # 非排他收紧时紧邻界内值为 bound-1（整数）/ 界内浮点；排他时为 bound
+        raw = bound if exclusive else bound - 1
+        probes: list = [raw, raw - 1, 0, -1]
+        if not integer_allowed:
+            probes += [bound - 0.5, bound]
+    else:
+        raw = bound if exclusive else bound + 1
+        probes = [raw, raw + 1, 0, 1]
+        if not integer_allowed:
+            probes += [bound + 0.5, bound]
+    if integer_allowed:
+        # integer 类型下把候选规整为 int（4.0 -> 4）
+        probes = [int(math.ceil(v)) if isinstance(v, float) else v for v in probes]
+    # 去重保序（1 == 1.0 视为同值）
+    out: list = []
+    for value in probes:
+        if all(not value_eq(value, kept) for kept in out):
+            out.append(value)
+    return out
+
+
 def _check_number(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> None:
     old_lo, old_lo_ex = _lower_bound(old)
     new_lo, new_lo_ex = _lower_bound(new)
@@ -1194,36 +1338,38 @@ def _check_number(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> N
     # ---- 下界提高 / 排他化 -------------------------------------------------
     if new_lo is not None:
         if old_lo is None:
-            candidate = new_lo - 1
+            candidates = _number_candidates(old, new_lo, False, "min")
         elif new_lo > old_lo or (new_lo == old_lo and new_lo_ex and not old_lo_ex):
-            candidate = new_lo if (new_lo == old_lo and new_lo_ex) else new_lo - 1
+            candidates = _number_candidates(old, new_lo, new_lo_ex, "min")
         else:
-            candidate = None
-        if candidate is not None:
+            candidates = []
+        for candidate in candidates:
             doc, _ = builder.embed(path, candidate)
             if builder.verified_witness(doc):
                 builder.add(path, "minimum_increased",
                             f"新版下界收紧为 {fmt_bound(new_lo, new_lo_ex)}",
                             f"最小值约束提高，旧版允许的 {candidate} 在新版会被拒绝",
                             fragment=candidate)
+                break
 
     # ---- 上界降低 / 排他化 -------------------------------------------------
     old_hi, old_hi_ex = _upper_bound(old)
     new_hi, new_hi_ex = _upper_bound(new)
     if new_hi is not None:
         if old_hi is None:
-            candidate = new_hi + 1
+            candidates = _number_candidates(old, new_hi, False, "max")
         elif new_hi < old_hi or (new_hi == old_hi and new_hi_ex and not old_hi_ex):
-            candidate = new_hi if (new_hi == old_hi and new_hi_ex) else new_hi + 1
+            candidates = _number_candidates(old, new_hi, new_hi_ex, "max")
         else:
-            candidate = None
-        if candidate is not None:
+            candidates = []
+        for candidate in candidates:
             doc, _ = builder.embed(path, candidate)
             if builder.verified_witness(doc):
                 builder.add(path, "maximum_decreased",
                             f"新版上界收紧为 {fmt_bound(new_hi, new_hi_ex)}",
                             f"最大值约束降低，旧版允许的 {candidate} 在新版会被拒绝",
                             fragment=candidate)
+                break
 
     # ---- 新增整数约束 / multipleOf（启发式）--------------------------------
     if type_set(old) is None and type_set(new) and "integer" in type_set(new):
@@ -1800,14 +1946,17 @@ def _check_condition_routing(abs_path: tuple, old: dict, new: dict,
 # 样例驱动分析
 # ---------------------------------------------------------------------------
 
-def check_samples(samples: list | None, old: Any, new: Any) -> tuple[list[dict], list[dict]]:
+def check_samples(samples: list | None, old: Any, new: Any,
+                  old_validator=None, new_validator=None) -> tuple[list[dict], list[dict]]:
     issues: list[dict] = []
     results: list[dict] = []
     if not samples:
         return issues, results
 
-    old_validator = make_validator(old)
-    new_validator = make_validator(new)
+    if old_validator is None:
+        old_validator = make_validator(old)
+    if new_validator is None:
+        new_validator = make_validator(new)
     for index, sample in enumerate(samples):
         old_errors = sorted(old_validator.iter_errors(sample), key=lambda e: list(e.absolute_path))
         new_errors = sorted(new_validator.iter_errors(sample), key=lambda e: list(e.absolute_path))
@@ -1854,13 +2003,21 @@ DIRECTION_META = OrderedDict([
 
 
 def analyze(old_schema: Any, new_schema: Any, samples: list | None = None) -> dict:
+    # 反例校验始终在**原始 schema**上进行：$ref 展开只服务于结构比较，
+    # 旧规范“$ref 忽略同级约束”、循环引用等语义由原始校验器精确表达。
+    old_validator = make_validator(old_schema)
+    new_validator = make_validator(new_schema)
+
     old_resolved = resolve_refs(old_schema)
     new_resolved = resolve_refs(new_schema)
 
-    backward = find_violations(old_resolved, new_resolved)
-    forward = find_violations(new_resolved, old_resolved)
+    backward = find_violations(old_resolved, new_resolved,
+                               old_validator, new_validator)
+    forward = find_violations(new_resolved, old_resolved,
+                              new_validator, old_validator)
 
-    sample_issues, sample_results = check_samples(samples, old_resolved, new_resolved)
+    sample_issues, sample_results = check_samples(
+        samples, old_resolved, new_resolved, old_validator, new_validator)
     for issue in sample_issues:
         direction = "backward" if issue["code"] == "sample_rejected_by_new" else "forward"
         (backward if direction == "backward" else forward).append(issue)

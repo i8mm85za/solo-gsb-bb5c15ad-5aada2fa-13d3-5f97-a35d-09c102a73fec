@@ -199,6 +199,132 @@ class TestRef:
         assert not report["backward_compatible"]
         assert not report["forward_compatible"]
 
+    def test_modern_ref_sibling_minimum_breaks_forward(self):
+        # 2020-12：$ref 与同级 minimum 同时生效。旧版等价于 integer & >=5，
+        # 新版仅允许 integer —— 数值 2 旧版拒绝、新版接受，破坏向前兼容。
+        old = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"n": {"$ref": "#/$defs/int", "minimum": 5}},
+            "$defs": {"int": {"type": "integer"}},
+        }
+        new = {"type": "object", "properties": {"n": {"type": "integer"}}}
+        report = analyze(old, new)
+        assert report["backward_compatible"]
+        assert not report["forward_compatible"]
+        fwd = [i for i in report["issues"]
+               if i["direction"] == "forward" and i["severity"] == "error"]
+        assert fwd and fwd[0]["code"] == "minimum_increased"
+        ce = fwd[0]["counterexample"]
+        assert isinstance(ce["n"], int) and not isinstance(ce["n"], bool)
+        # 反例必须经原始两版 schema 验证：新版合法、旧版拒绝
+        assert compat.make_validator(new).is_valid(ce)
+        assert not compat.make_validator(old).is_valid(ce)
+        assert not compat.make_validator(old).is_valid({"n": 2})
+        assert compat.make_validator(new).is_valid({"n": 2})
+
+    def test_2019_09_ref_sibling_minimum_breaks_forward(self):
+        old = {
+            "$schema": "https://json-schema.org/draft/2019-09/schema",
+            "type": "object",
+            "properties": {"n": {"$ref": "#/$defs/int", "minimum": 5}},
+            "$defs": {"int": {"type": "integer"}},
+        }
+        new = {"type": "object", "properties": {"n": {"type": "integer"}}}
+        report = analyze(old, new)
+        assert report["backward_compatible"]
+        assert not report["forward_compatible"]
+        assert "minimum_increased" in codes(report, "forward")
+
+    def test_draft7_ref_sibling_minimum_is_ignored(self):
+        # Draft-07：$ref 是引用跳转，同级 minimum 被忽略，旧版仅为 integer，
+        # 与新版 integer 完全等价 —— 两方向都兼容，不应误报。
+        old = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": {"n": {"$ref": "#/definitions/int", "minimum": 5}},
+            "definitions": {"int": {"type": "integer"}},
+        }
+        new = {"type": "object", "properties": {"n": {"type": "integer"}}}
+        report = analyze(old, new)
+        assert report["backward_compatible"]
+        assert report["forward_compatible"]
+        assert not [i for i in report["issues"] if i["severity"] == "error"]
+        # jsonschema 的 draft-07 校验器同样接受 {n:2}
+        assert compat.make_validator(old).is_valid({"n": 2})
+
+    def test_nested_ref_chain_with_sibling_constraint(self):
+        # 嵌套引用 A -> B -> integer，minimum:5 同级声明在 A 上
+        old = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"n": {"$ref": "#/$defs/A", "minimum": 5}},
+            "$defs": {
+                "A": {"$ref": "#/$defs/B"},
+                "B": {"$ref": "#/$defs/int"},
+                "int": {"type": "integer"},
+            },
+        }
+        new = {"type": "object", "properties": {"n": {"type": "integer"}}}
+        report = analyze(old, new)
+        assert not report["forward_compatible"]
+        assert "minimum_increased" in codes(report, "forward")
+
+    def test_ref_sibling_required_modern_dialect(self):
+        # required 与 $ref 同级（现代规范）：旧版要求 a 必填，新版不要求
+        old = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": "#/$defs/Base",
+            "required": ["a"],
+            "$defs": {"Base": {"type": "object",
+                               "properties": {"a": {"type": "string"}}}},
+        }
+        new = {"type": "object", "properties": {"a": {"type": "string"}}}
+        report = analyze(old, new)
+        assert not report["forward_compatible"]
+        assert "required_added" in codes(report, "forward")
+
+    def test_cyclic_ref_analysis_terminates(self):
+        # 自引用定义必须安全终止，且不产生经原始 schema 验证失败的假反例
+        old = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "n": {"$ref": "#/$defs/Node", "minimum": 5},
+                "child": {"$ref": "#/$defs/Node"},
+            },
+            "$defs": {"Node": {"$ref": "#/$defs/Node", "type": "integer"}},
+        }
+        new = {
+            "type": "object",
+            "properties": {"n": {"type": "integer"}, "child": {}},
+        }
+        report = analyze(old, new)
+        for issue in report["issues"]:
+            if issue["counterexample"] is None:
+                continue
+            source, target = ((old, new) if issue["direction"] == "backward"
+                              else (new, old))
+            assert compat.make_validator(source).is_valid(issue["counterexample"])
+            assert not compat.make_validator(target).is_valid(issue["counterexample"])
+
+    def test_conjunct_bounds_use_stricter_target(self):
+        # 目标 minimum:10 + 同级 minimum:5（合取取严，实际下界 10）
+        old = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"n": {"$ref": "#/$defs/int", "minimum": 5}},
+            "$defs": {"int": {"type": "integer", "minimum": 10}},
+        }
+        new = {"type": "object", "properties": {"n": {"type": "integer"}}}
+        report = analyze(old, new)
+        assert not report["forward_compatible"]
+        ce = next(i["counterexample"] for i in report["issues"]
+                  if i["direction"] == "forward" and i["code"] == "minimum_increased")
+        assert ce["n"] < 10
+        assert compat.make_validator(new).is_valid(ce)
+        assert not compat.make_validator(old).is_valid(ce)
+
 
 class TestCounterexamples:
     """每个 error 若附了反例，反例必须真实满足旧版、违反新版。"""
