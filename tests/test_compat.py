@@ -1,4 +1,6 @@
 """兼容性引擎测试。"""
+import json
+
 import pytest
 
 from app import compat
@@ -198,6 +200,133 @@ class TestRef:
         report = analyze(old, new)
         assert not report["backward_compatible"]
         assert not report["forward_compatible"]
+
+    D2020 = "https://json-schema.org/draft/2020-12/schema"
+    D2019 = "https://json-schema.org/draft/2019-09/schema"
+    D7 = "http://json-schema.org/draft-07/schema#"
+
+    def _sibling_min_schemas(self, dialect):
+        # 旧版：$ref 指向整数定义，同级声明 minimum: 5
+        old = {"$schema": dialect, "type": "object",
+               "properties": {"value": {"$ref": "#/$defs/int", "minimum": 5}},
+               "$defs": {"int": {"type": "integer"}}}
+        new = {"$schema": dialect, "type": "object",
+               "properties": {"value": {"type": "integer"}}}
+        return old, new
+
+    @pytest.mark.parametrize("dialect", [D2020, D2019])
+    def test_modern_dialect_ref_sibling_minimum_breaks_forward(self, dialect):
+        # 2019-09/2020-12：$ref 与 minimum 同级约束同时生效。
+        # 旧版拒绝 2、新版接受 2 -> 向前不兼容（向后兼容）。
+        old, new = self._sibling_min_schemas(dialect)
+        report = analyze(old, new)
+        assert report["backward_compatible"] is True
+        assert report["forward_compatible"] is False
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "forward" and i["severity"] == "error"][0]
+        assert issue["code"] == "minimum_increased"
+        assert issue["path"] == "#/properties/value"
+        # 反例经原始两版 schema 验证：新版合法、旧版拒绝
+        ce = issue["counterexample"]
+        assert isinstance(ce["value"], int)
+        assert compat.make_validator(new).is_valid(ce)
+        assert not compat.make_validator(old).is_valid(ce)
+        # 任务给出的边界事实：2 被旧版拒绝、新版接受
+        assert not compat.make_validator(old).is_valid({"value": 2})
+        assert compat.make_validator(new).is_valid({"value": 2})
+
+    def test_legacy_dialect_ref_sibling_minimum_ignored(self):
+        # draft-07：$ref 使同级 minimum 被忽略 -> 旧版等价于纯 integer，
+        # 与新版（integer）两个方向都兼容。
+        old, new = self._sibling_min_schemas(self.D7)
+        report = analyze(old, new)
+        assert report["backward_compatible"] is True
+        assert report["forward_compatible"] is True
+        assert report["issues"] == []
+        assert compat.make_validator(old).is_valid({"value": 2})
+
+    def test_default_dialect_keeps_ref_siblings(self):
+        # 未声明 $schema：默认按最新草案（同级约束生效）
+        old = {"type": "object",
+               "properties": {"value": {"$ref": "#/$defs/int", "minimum": 5}},
+               "$defs": {"int": {"type": "integer"}}}
+        new = {"type": "object", "properties": {"value": {"type": "integer"}}}
+        report = analyze(old, new)
+        assert report["backward_compatible"] is True
+        assert report["forward_compatible"] is False
+
+    def test_modern_dialect_ref_sibling_required_breaks_forward(self):
+        old = {"$schema": self.D2020, "$ref": "#/$defs/base", "required": ["x"],
+               "$defs": {"base": {"type": "object",
+                                  "properties": {"x": {"type": "string"}}}}}
+        new = {"$schema": self.D2020, "type": "object",
+               "properties": {"x": {"type": "string"}}}
+        report = analyze(old, new)
+        assert report["backward_compatible"] is True
+        assert report["forward_compatible"] is False
+        issue = [i for i in report["issues"] if i["direction"] == "forward"][0]
+        assert issue["code"] == "required_added"
+        ce = issue["counterexample"]
+        assert compat.make_validator(new).is_valid(ce)
+        assert not compat.make_validator(old).is_valid(ce)
+
+    def test_legacy_dialect_ref_sibling_required_ignored(self):
+        old = {"$schema": self.D7, "$ref": "#/definitions/base", "required": ["x"],
+               "definitions": {"base": {"type": "object",
+                                        "properties": {"x": {"type": "string"}}}}}
+        new = {"$schema": self.D7, "type": "object",
+               "properties": {"x": {"type": "string"}}}
+        report = analyze(old, new)
+        assert report["backward_compatible"] is True
+        assert report["forward_compatible"] is True
+        # draft-07 同级 required 被 $ref 吞掉，{} 在旧版合法
+        assert compat.make_validator(old).is_valid({})
+
+    def test_nested_ref_chain_expands_with_false_cycle(self):
+        # x -> y -> 整数定义；多个分支引用同一目标（菱形）不能误判成环
+        old = {"$schema": self.D2020, "type": "object",
+               "properties": {"a": {"$ref": "#/$defs/x"},
+                              "b": {"$ref": "#/$defs/x"}},
+               "$defs": {"x": {"$ref": "#/$defs/y", "minimum": 5},
+                         "y": {"type": "integer"}}}
+        new = {"$schema": self.D2020, "type": "object",
+               "properties": {"a": {"type": "integer"},
+                              "b": {"type": "integer"}}}
+        report = analyze(old, new)
+        assert report["backward_compatible"] is True
+        assert report["forward_compatible"] is False
+        paths = {i["path"] for i in report["issues"] if i["direction"] == "forward"}
+        assert paths == {"#/properties/a", "#/properties/b"}
+
+    def test_cyclic_self_reference_terminates(self):
+        # 链表式自引用 + 深层 minimum 差异：展开必须终止且方向正确
+        old = {"$schema": self.D2020, "type": "object",
+               "properties": {"head": {"$ref": "#/$defs/Node"}},
+               "$defs": {"Node": {"type": "object",
+                                  "properties": {"v": {"type": "integer", "minimum": 5},
+                                                 "next": {"$ref": "#/$defs/Node"}},
+                                  "required": ["v"]}}}
+        new = json.loads(json.dumps(old))
+        new["$defs"]["Node"]["properties"]["v"] = {"type": "integer"}
+        report = analyze(old, new)
+        assert report["backward_compatible"] is True
+        assert report["forward_compatible"] is False
+        issue = [i for i in report["issues"] if i["direction"] == "forward"][0]
+        ce = issue["counterexample"]
+        assert compat.make_validator(new).is_valid(ce)
+        assert not compat.make_validator(old).is_valid(ce)
+        # 同版自比：无破坏（展开收敛、无伪报）
+        assert analyze(old, old)["issues"] == []
+
+    def test_mutual_reference_cycle_terminates_without_error(self):
+        # A <-> B 互引：分析必须终止，不抛 RecursionError
+        schema = {"$schema": self.D2020, "type": "object",
+                  "properties": {"p": {"$ref": "#/$defs/A"}},
+                  "$defs": {"A": {"$ref": "#/$defs/B"},
+                            "B": {"$ref": "#/$defs/A", "type": "integer"}}}
+        report = analyze(schema, schema)
+        assert report["backward_compatible"] is True
+        assert report["forward_compatible"] is True
 
 
 class TestCounterexamples:

@@ -129,6 +129,53 @@ def test_conditional_if_then_else_end_to_end(client):
     assert issue["counterexample"]["kind"] == "a"
 
 
+def test_ref_sibling_keywords_dialect_2020_vs_draft7(client):
+    """$ref 同级约束：2020-12 同时生效（向前破坏），draft-07 引用吞掉同级（兼容）。"""
+    def schemas(dialect):
+        old = {
+            "$schema": dialect, "type": "object",
+            "properties": {"value": {"$ref": "#/$defs/int", "minimum": 5}},
+            "$defs": {"int": {"type": "integer"}},
+        }
+        new = {
+            "$schema": dialect, "type": "object",
+            "properties": {"value": {"type": "integer"}},
+        }
+        return old, new
+
+    old, new = schemas("https://json-schema.org/draft/2020-12/schema")
+    resp = client.post("/api/analyses", json={
+        "name": "ref-sibling-2020", "old_schema": old, "new_schema": new,
+        "samples": [{"value": 2}],
+    })
+    assert resp.status_code == 201, resp.text
+    report = resp.json()["report"]
+    # 旧版拒绝 2、新版接受 2 -> 仅向前不兼容
+    assert report["backward_compatible"] is True
+    assert report["forward_compatible"] is False
+    forward = [i for i in report["issues"] if i["direction"] == "forward"]
+    structural = [i for i in forward if i["code"] != "sample_rejected_by_old"]
+    assert structural and structural[0]["code"] == "minimum_increased"
+    assert structural[0]["path"] == "#/properties/value"
+    ce = structural[0]["counterexample"]
+    assert ce is not None
+    from app import compat as _compat
+    assert _compat.make_validator(new).is_valid(ce)
+    assert not _compat.make_validator(old).is_valid(ce)
+    # 真实样本 2 同样被识别为 forward 实锤
+    assert any(i["code"] == "sample_rejected_by_old" for i in forward)
+
+    # 同样的结构在 draft-07 下：$ref 吞掉 minimum，两方向都兼容
+    old7, new7 = schemas("http://json-schema.org/draft-07/schema#")
+    resp7 = client.post("/api/analyses", json={
+        "name": "ref-sibling-draft7", "old_schema": old7, "new_schema": new7,
+    })
+    assert resp7.status_code == 201, resp7.text
+    report7 = resp7.json()["report"]
+    assert report7["backward_compatible"] is True
+    assert report7["forward_compatible"] is True
+
+
 # ---------------------------------------------------------------------------
 # POST /api/analyses/compare
 # ---------------------------------------------------------------------------
